@@ -1,0 +1,114 @@
+import { createSignal, getObserver, onCleanup, type SignalOptions, DEV } from "solid-js";
+import { isServer } from "@solidjs/web";
+
+// Vendored from @solid-primitives/trigger (the `next` branch, which targets
+// Solid 2.0):
+// https://github.com/solidjs-community/solid-primitives/blob/next/packages/trigger/src/index.ts
+// The published package is still pinned to Solid 1.x internals and the 2.0 port
+// has not been released to npm yet. The only change from upstream is inlining
+// `noop` instead of importing it from @solid-primitives/utils (another package
+// not yet ported), to keep this binding free of Solid 1.x-coupled deps.
+const noop = (): void => {};
+
+export type Trigger = [track: VoidFunction, dirty: VoidFunction];
+
+const triggerOptions: SignalOptions<any> = !isServer && DEV
+  ? { equals: false, name: "trigger", ownedWrite: true }
+  : { equals: false, ownedWrite: true };
+
+const triggerCacheOptions: SignalOptions<any> = { equals: false, ownedWrite: true };
+
+/**
+ * Set listeners in reactive computations and then trigger them when you want.
+ * @returns `[track function, dirty function]`
+ * @example
+ * const [track, dirty] = createTrigger()
+ * createEffect(() => {
+ *    track()
+ *    ...
+ * })
+ * // later
+ * dirty()
+ */
+export function createTrigger(): Trigger {
+  if (isServer) {
+    return [noop, noop];
+  }
+  return createSignal(undefined, triggerOptions);
+}
+
+export class TriggerCache<T> {
+  #map: Map<
+    T,
+    {
+      // track
+      $(): void;
+      // dirty
+      $$(): void;
+      // n of listeners
+      n: number;
+    }
+  >;
+
+  constructor(mapConstructor: WeakMapConstructor | MapConstructor = Map) {
+    this.#map = new (mapConstructor as MapConstructor)();
+  }
+
+  dirty(key: T) {
+    if (isServer) return;
+    this.#map.get(key)?.$$();
+  }
+
+  dirtyAll() {
+    if (isServer) return;
+    for (const trigger of this.#map.values()) trigger.$$();
+  }
+
+  track(key: T) {
+    if (!getObserver()) return;
+    let trigger = this.#map.get(key);
+    if (!trigger) {
+      const [$, $$] = createSignal(undefined, triggerCacheOptions);
+      this.#map.set(key, (trigger = { $, $$, n: 1 }));
+    } else trigger.n++;
+    onCleanup(() => {
+      if (--trigger.n === 0)
+        queueMicrotask(() => trigger.n === 0 && this.#map.delete(key));
+    });
+    trigger.$();
+  }
+}
+
+/**
+ * Creates a cache of triggers that can be used to mark dirty only specific keys.
+ *
+ * Cache is a `Map` or `WeakMap` depending on the `mapConstructor` argument. (default: `Map`)
+ *
+ * If `mapConstructor` is `WeakMap` then the cache will be weak and the keys will be garbage collected when they are no longer referenced.
+ *
+ * Trigger signals added to the cache only when tracked under a computation,
+ * and get deleted from the cache when they are no longer tracked.
+ *
+ * @returns a tuple of `[track, dirty, dirtyAll]` functions
+ *
+ * `track` and `dirty` are called with a `key` so that each tracker will trigger an update only when his individual `key` would get marked as dirty.
+ * `dirtyAll` will mark all keys as dirty and trigger an update for all of them.
+ * @example
+ * const [track, dirty, dirtyAll] = createTriggerCache()
+ * createEffect(() => {
+ *    track(1)
+ *    ...
+ * })
+ * // later
+ * dirty(1)
+ * // this won't cause an update:
+ * dirty(2)
+ * // this will cause an update to all keys:
+ * dirtyAll()
+ */
+export function createTriggerCache<T>(
+  mapConstructor: WeakMapConstructor | MapConstructor = Map,
+): [track: (key: T) => void, dirty: (key: T) => void, dirtyAll: () => void] {
+  const map = new TriggerCache(mapConstructor);
+  return [map.track.bind(map), map.dirty.bind(map), map.dirtyAll.bind(map)];
+}

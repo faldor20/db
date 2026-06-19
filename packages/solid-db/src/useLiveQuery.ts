@@ -1,18 +1,16 @@
 import {
-  batch,
   createEffect,
   createMemo,
-  createResource,
   createSignal,
-  onCleanup,
+  createStore,
+  untrack,
 } from 'solid-js'
-import { ReactiveMap } from '@solid-primitives/map'
 import {
   BaseQueryBuilder,
   CollectionImpl,
   createLiveQueryCollection,
 } from '@tanstack/db'
-import { createStore, reconcile } from 'solid-js/store'
+import { ReactiveMap } from './reactive-map'
 import type { Accessor } from 'solid-js'
 import type {
   ChangeMessage,
@@ -286,113 +284,92 @@ export function useLiveQuery<
 export function useLiveQuery(
   configOrQueryOrCollection: (queryFn?: any) => any,
 ) {
-  const collection = createMemo(
-    () => {
-      if (configOrQueryOrCollection.length === 1) {
-        // This is a query function - check if it returns null/undefined
-        const queryBuilder = new BaseQueryBuilder() as InitialQueryBuilder
-        const result = configOrQueryOrCollection(queryBuilder)
+  const collection = createMemo(() => {
+    if (configOrQueryOrCollection.length === 1) {
+      // This is a query function - check if it returns null/undefined
+      const queryBuilder = new BaseQueryBuilder() as InitialQueryBuilder
+      const result = configOrQueryOrCollection(queryBuilder)
 
-        if (result === undefined || result === null) {
-          // Disabled query - return null
-          return null
-        }
-
-        return createLiveQueryCollection({
-          query: configOrQueryOrCollection,
-          startSync: true,
-        })
-      }
-
-      const innerCollection = configOrQueryOrCollection()
-
-      if (innerCollection === undefined || innerCollection === null) {
+      if (result === undefined || result === null) {
         // Disabled query - return null
         return null
       }
 
-      if (innerCollection instanceof CollectionImpl) {
-        innerCollection.startSyncImmediate()
-        return innerCollection as Collection
-      }
-
       return createLiveQueryCollection({
-        ...innerCollection,
+        query: configOrQueryOrCollection,
         startSync: true,
       })
-    },
-    undefined,
-    { name: `TanstackDBCollectionMemo` },
-  )
+    }
+
+    const innerCollection = configOrQueryOrCollection()
+
+    if (innerCollection === undefined || innerCollection === null) {
+      // Disabled query - return null
+      return null
+    }
+
+    if (innerCollection instanceof CollectionImpl) {
+      innerCollection.startSyncImmediate()
+      return innerCollection as Collection
+    }
+
+    return createLiveQueryCollection({
+      ...innerCollection,
+      startSync: true,
+    })
+  })
 
   // Reactive state that gets updated granularly through change events
   const state = new ReactiveMap<string | number, any>()
 
   // Reactive data array that maintains sorted order
-  const [data, setData] = createStore<Array<any>>([], {
-    name: `TanstackDBData`,
-  })
+  const [data, setData] = createStore<Array<any>>([])
 
-  // Track collection status reactively
-  const [status, setStatus] = createSignal(
-    collection() ? collection()!.status : (`disabled` as const),
-    {
-      name: `TanstackDBStatus`,
-    },
+  // Track collection status reactively. Read the initial value untracked so
+  // the hook body doesn't register a top-level reactive read (forbidden in
+  // Solid 2.0); the effect below keeps it up to date afterwards.
+  const [status, setStatus] = createSignal<CollectionStatus | `disabled`>(
+    untrack(() => {
+      const c = collection()
+      return c ? c.status : `disabled`
+    }),
   )
 
-  // Helper to sync data array from collection in correct order
+  // Helper to sync data array from collection in correct order. Returning a
+  // new array from the store setter diffs it into the existing store array by
+  // index, so rows whose object reference is unchanged keep their store
+  // identity (and don't trigger downstream updates) while only the rows that
+  // actually changed are replaced — the fine-grained render path.
   const syncDataFromCollection = (
     currentCollection: Collection<any, any, any>,
   ) => {
-    setData((prev) =>
-      reconcile(Array.from(currentCollection.values()))(prev).filter(Boolean),
-    )
+    const next = Array.from(currentCollection.values()).filter(Boolean)
+    setData(() => next)
   }
 
-  const [getDataResource] = createResource(
-    () => ({ currentCollection: collection() }),
-    async ({ currentCollection }) => {
+  // Solid 2.0 removes createResource. Live queries stream their data in via
+  // the change subscription below, so we drive the reactive `data`/`state`
+  // and `status` entirely from that subscription plus a readiness check.
+  createEffect(
+    () => collection(),
+    (currentCollection) => {
       if (!currentCollection) {
-        return []
-      }
-      setStatus(currentCollection.status)
-      try {
-        await currentCollection.toArrayWhenReady()
-      } catch (error) {
-        setStatus(`error`)
-        throw error
-      }
-      // Initialize state with current collection data
-      batch(() => {
+        setStatus(`disabled`)
         state.clear()
-        for (const [key, value] of currentCollection.entries()) {
-          state.set(key, value)
-        }
-        syncDataFromCollection(currentCollection)
-        setStatus(currentCollection.status)
-      })
-      return data
-    },
-    {
-      name: `TanstackDBData`,
-      deferStream: false,
-      initialValue: data,
-    },
-  )
+        setData(() => [])
+        return
+      }
 
-  createEffect(() => {
-    const currentCollection = collection()
-    if (!currentCollection) {
-      setStatus(`disabled` as const)
+      // Reset for a clean switch between collections (the new subscription's
+      // initial state only emits inserts, never deletes for the old one).
       state.clear()
-      setData([])
-      return
-    }
-    const subscription = currentCollection.subscribeChanges(
-      (changes: Array<ChangeMessage<any>>) => {
-        // Apply each change individually to the reactive state
-        batch(() => {
+      setData(() => [])
+      setStatus(currentCollection.status)
+
+      let disposed = false
+
+      const subscription = currentCollection.subscribeChanges(
+        (changes: Array<ChangeMessage<any>>) => {
           for (const change of changes) {
             switch (change.type) {
               case `insert`:
@@ -407,34 +384,44 @@ export function useLiveQuery(
 
           syncDataFromCollection(currentCollection)
 
-          // Update status ref on every change
+          // Update status on every change
           setStatus(currentCollection.status)
+        },
+        {
+          // Include initial state to ensure immediate population for
+          // pre-created collections
+          includeInitialState: true,
+        },
+      )
+
+      // The change subscription won't fire when a collection is marked ready
+      // with no data, so settle the status off readiness explicitly too.
+      currentCollection
+        .toArrayWhenReady()
+        .then(() => {
+          if (!disposed) setStatus(currentCollection.status)
         })
-      },
-      {
-        // Include initial state to ensure immediate population for pre-created collections
-        includeInitialState: true,
-      },
-    )
+        .catch(() => {
+          if (!disposed) setStatus(`error`)
+        })
 
-    onCleanup(() => {
-      subscription.unsubscribe()
-    })
-  })
+      return () => {
+        disposed = true
+        subscription.unsubscribe()
+      }
+    },
+  )
 
-  // We have to remove getters from the resource function so we wrap it
   function getData() {
     const currentCollection = collection()
     if (currentCollection) {
       const config: CollectionConfigSingleRowOption<any, any, any> =
         currentCollection.config
       if (config.singleResult) {
-        // Force resource tracking so Suspense works
-        getDataResource()
         return data[0]
       }
     }
-    return getDataResource()
+    return data
   }
 
   Object.defineProperties(getData, {

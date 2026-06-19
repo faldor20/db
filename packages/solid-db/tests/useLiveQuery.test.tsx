@@ -9,13 +9,7 @@ import {
   eq,
   gt,
 } from '@tanstack/db'
-import {
-  For,
-  Suspense,
-  createComputed,
-  createRoot,
-  createSignal,
-} from 'solid-js'
+import { For, Loading, createEffect, createRoot, createSignal } from 'solid-js'
 import { useLiveQuery } from '../src/useLiveQuery'
 import { mockSyncCollectionOptions } from '../../db/tests/utils'
 import type { Accessor } from 'solid-js'
@@ -661,15 +655,24 @@ describe(`Query Collections`, () => {
           })),
       )
 
-      // Track each render state
-      createComputed(() => {
-        renderStates.push({
-          stateSize: queryResult.state.size,
-          hasTempKey: queryResult.state.has(`[temp-key,1]`),
-          hasPermKey: queryResult.state.has(`[4,1]`),
-          timestamp: Date.now(),
-        })
-      })
+      // Track each render state. Solid 2.0 splits effects into compute (which
+      // tracks) and apply (which runs the side effect); the tracked reads live
+      // in compute, the push lives in apply.
+      createEffect(
+        () => [
+          queryResult.state.size,
+          queryResult.state.has(`[temp-key,1]`),
+          queryResult.state.has(`[4,1]`),
+        ],
+        ([stateSize, hasTempKey, hasPermKey]) => {
+          renderStates.push({
+            stateSize: stateSize as number,
+            hasTempKey: hasTempKey as boolean,
+            hasPermKey: hasPermKey as boolean,
+            timestamp: Date.now(),
+          })
+        },
+      )
 
       return queryResult
     })
@@ -1895,9 +1898,9 @@ describe(`Query Collections`, () => {
       }
 
       const { findByTestId } = render(() => (
-        <Suspense fallback={<div data-testid="loading">Loading...</div>}>
+        <Loading fallback={<div data-testid="loading">Loading...</div>}>
           <TestComponent />
-        </Suspense>
+        </Loading>
       ))
 
       // Should eventually show the list with data
@@ -1942,9 +1945,9 @@ describe(`Query Collections`, () => {
       }
 
       const { findByTestId } = render(() => (
-        <Suspense fallback={<div data-testid="loading">Loading...</div>}>
+        <Loading fallback={<div data-testid="loading">Loading...</div>}>
           <TestComponent />
-        </Suspense>
+        </Loading>
       ))
 
       // Should eventually resolve and show data
@@ -1973,12 +1976,15 @@ describe(`Query Collections`, () => {
 
       function RowComponent(props: { person: { id: string; name: string } }) {
         const id = props.person.id
-        // createComputed fires once initially and again each time person.name changes
-        createComputed(() => {
-          // Access name to subscribe to it
-          void props.person.name
-          nameEffectCounts[id] = (nameEffectCounts[id] || 0) + 1
-        })
+        // Fires once initially and again each time person.name changes. In
+        // Solid 2.0 the tracked read goes in the compute phase and the counter
+        // bump (a side effect) goes in the apply phase.
+        createEffect(
+          () => props.person.name,
+          () => {
+            nameEffectCounts[id] = (nameEffectCounts[id] || 0) + 1
+          },
+        )
         return <li data-testid={`person-${id}`}>{props.person.name}</li>
       }
 
