@@ -7,15 +7,15 @@ import {
 } from 'solid-js'
 import {
   BaseQueryBuilder,
-  CollectionImpl,
   createLiveQueryCollection,
+  isCollection,
+  isSingleResultCollection,
 } from '@tanstack/db'
 import { ReactiveMap } from './reactive-map'
 import type { Accessor } from 'solid-js'
 import type {
   ChangeMessage,
   Collection,
-  CollectionConfigSingleRowOption,
   CollectionStatus,
   Context,
   GetResult,
@@ -308,7 +308,7 @@ export function useLiveQuery(
       return null
     }
 
-    if (innerCollection instanceof CollectionImpl) {
+    if (isCollection(innerCollection)) {
       innerCollection.startSyncImmediate()
       return innerCollection as Collection
     }
@@ -415,9 +415,7 @@ export function useLiveQuery(
   function getData() {
     const currentCollection = collection()
     if (currentCollection) {
-      const config: CollectionConfigSingleRowOption<any, any, any> =
-        currentCollection.config
-      if (config.singleResult) {
+      if (isSingleResultCollection(currentCollection)) {
         return data[0]
       }
     }
